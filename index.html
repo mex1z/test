@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<meta name="theme-color" content="#10101f" />
+<title>Deepmine — pixel mine &amp; wave arena</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><rect width='16' height='16' fill='%2310101f'/><rect x='3' y='3' width='4' height='4' fill='%23ffd447'/><rect x='9' y='3' width='4' height='4' fill='%23b58cff'/><rect x='3' y='9' width='10' height='4' fill='%234ecbd8'/></svg>" />
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #08070f;
+    overflow: hidden;
+    font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+    -webkit-tap-highlight-color: transparent;
+  }
+  body {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background:
+      radial-gradient(circle at 50% 22%, #241d3a 0%, #131120 46%, #08070f 100%);
+  }
+  #stage {
+    position: relative;
+    line-height: 0;
+    filter: drop-shadow(0 0 42px rgba(120, 96, 220, 0.28));
+  }
+  canvas#game {
+    display: block;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    background: #10101f;
+    border: 3px solid #3a3358;
+    border-radius: 2px;
+    cursor: none;
+    touch-action: none;
+    user-select: none;
+  }
+  #hint {
+    position: fixed;
+    bottom: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+    color: #5f5a80;
+    font-size: 11px;
+    letter-spacing: 1px;
+    line-height: 1.4;
+    text-align: center;
+    pointer-events: none;
+    user-select: none;
+    white-space: nowrap;
+  }
+  #fatal {
+    position: fixed;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: #0b0a14;
+    color: #ff9db1;
+    font-size: 13px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    text-align: center;
+    z-index: 10;
+  }
+  @media (max-width: 640px) {
+    #hint { display: none; }
+    canvas#game { border-width: 2px; }
+  }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="game" width="960" height="576" aria-label="Deepmine game canvas"></canvas>
+  </div>
+  <div id="hint">WASD / ARROWS to move &nbsp;·&nbsp; CLICK or SPACE to attack/mine &nbsp;·&nbsp; E portal &nbsp;·&nbsp; ESC pause &nbsp;·&nbsp; M sound</div>
+  <div id="fatal"></div>
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

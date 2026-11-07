@@ -1,0 +1,16 @@
+{
+  "name": "deepmine",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Deepmine - a 2D pixel top-down mine-and-fight wave game",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "shots": "node tools/shots.mjs",
+    "test": "node tools/validate-art.mjs && node tools/smoke.mjs"
+  },
+  "devDependencies": {
+    "@napi-rs/canvas": "^1.1.0"
+  }
+}
