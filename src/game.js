@@ -1352,6 +1352,7 @@ export class Game {
   render() {
     const ctx = this.ctx;
     this.ui.ctx = ctx;
+    this.updateCursorStyle();
     ctx.imageSmoothingEnabled = false;
     ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.clearRect(0, 0, VIEW_W, VIEW_H);
@@ -1679,9 +1680,21 @@ export class Game {
     }
   }
 
+  // Gameplay (hub + mine, not paused) uses the pixel crosshair with the system
+  // cursor hidden. Menus (title, shop, pause, summary, death) show the normal
+  // system cursor, so it is always visible there.
+  usePixelCursor() {
+    return this.state === STATE.HUB || (this.state === STATE.MINE && !this.paused);
+  }
+
+  updateCursorStyle() {
+    if (!this.canvas.style) return;
+    const css = this.usePixelCursor() ? 'none' : this.ui.cursor ? 'pointer' : 'default';
+    if (this.canvas.style.cursor !== css) this.canvas.style.cursor = css;
+  }
+
   renderCursor(ctx) {
-    // The canvas hides the system cursor everywhere (cursor: none), so the
-    // pixel cursor must be drawn on every screen, including menus.
+    if (!this.usePixelCursor()) return;
     const m = this.input.mouse;
     const cx = Math.round(m.x);
     const cy = Math.round(m.y);
