@@ -9,12 +9,13 @@ import {
   waveComposition,
   biomeForWave,
   MOBS,
+  ORE_TYPES,
 } from './data.js';
 import { World, T } from './world.js';
 import { SPRITES, drawSprite, drawShadow } from './sprites.js';
 import { drawText, textWidth, wrapText } from './font.js';
 import { play, initAudio, isMuted, toggleMute } from './audio.js';
-import { loadSave, writeSave, wipeSave } from './save.js';
+import { loadSave, writeSave, wipeSave, defaultSave } from './save.js';
 import { drawWorld, drawMineLighting, drawVignette, drawOreNode, clearTileCache } from './render.js';
 import { UI } from './ui.js';
 
@@ -58,6 +59,41 @@ function mulberry32(seed) {
     t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+const round1 = (v) => Math.round(v * 10) / 10;
+const round2 = (v) => Math.round(v * 100) / 100;
+
+// Stats a remote player brings into the cave (sent with their join message).
+function sanitizeStats(s = {}) {
+  const num = (v, lo, hi, d) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? clamp(n, lo, hi) : d;
+  };
+  return {
+    damage: num(s.damage, 1, 5000, 14),
+    power: num(s.power, 0.1, 500, 1),
+    goldMul: num(s.goldMul, 0.1, 100, 1),
+    crit: num(s.crit, 0, 1, 0.05),
+    maxHp: num(s.maxHp, 1, 10000, 100),
+  };
+}
+
+function serializeOre(nodes) {
+  return nodes.map((n) => ({ ...n, type: n.type.id }));
+}
+
+function restoreOre(list) {
+  return list.map((o) => ({
+    ...o,
+    type: ORE_TYPES.find((t) => t.id === o.type) || ORE_TYPES[0],
+    hitFlash: 0,
+    shake: 0,
+  }));
+}
+
+function mobDef(kind) {
+  return { ...(MOBS[kind] || MOBS.slime) };
 }
 
 export class Game {
@@ -107,6 +143,20 @@ export class Game {
     this.muted = isMuted();
     this.paused = false;
     this.saveTimer = 0;
+    // co-op (see the co-op section below)
+    this.net = null; // Net, when connected to a room
+    this.myId = null; // our id in the room
+    this.remotes = new Map(); // other players in the cave
+    this.simCave = false; // we run the shared cave simulation
+    this.peerCave = false; // we mirror someone else's cave
+    this.joinPending = false;
+    this.pendingOpen = false;
+    this.oreDirty = false;
+    this.netSnapTimer = 0;
+    this.netInputTimer = 0;
+    this.saveDirty = false;
+    this.saveSendTimer = 0;
+    this.onRoomChange = null; // lobby hook
   }
 
   // ------------------------------------------------------------------ helpers
@@ -136,7 +186,9 @@ export class Game {
 
   saveNow() {
     this.save.hp = Math.max(1, Math.min(this.save.hp, this.save.maxHp));
-    writeSave(this.save);
+    // co-op profiles live on the server; solo saves stay in localStorage
+    if (this.net) this.saveDirty = true;
+    else writeSave(this.save);
   }
 
   toast(text, color = '#f2f0ff') {
@@ -172,6 +224,14 @@ export class Game {
   // --------------------------------------------------------------- transitions
   startRun() {
     initAudio();
+    if (this.net) {
+      this.startCoopRun();
+      return;
+    }
+    this.beginRun();
+  }
+
+  beginRun() {
     this.save.hp = this.save.maxHp;
     this.save.runs = (this.save.runs || 0) + 1;
     this.wave = 1;
@@ -187,11 +247,13 @@ export class Game {
     this.saveNow();
   }
 
-  enterMine(wave) {
+  enterMine(wave, seed = null, peerOre = null) {
     this.wave = wave;
-    this.scene = new World({ kind: 'mine', wave, seed: (Date.now() ^ (wave * 7919)) >>> 0 });
+    this.scene = new World({ kind: 'mine', wave, seed: seed ?? ((Date.now() ^ (wave * 7919)) >>> 0) });
+    if (peerOre) this.scene.oreNodes = restoreOre(peerOre);
     clearTileCache();
     const p = this.player || {};
+    p.id = this.myId;
     p.x = this.scene.spawn.x;
     p.y = this.scene.spawn.y;
     p.vx = 0;
@@ -210,6 +272,7 @@ export class Game {
     this.state = STATE.MINE;
     this.startMiningPhase(false);
     this.waveBanner = 2.2;
+    this.oreDirty = true;
   }
 
   startMiningPhase(announce = true) {
@@ -237,8 +300,9 @@ export class Game {
     play('clear');
     this.save.bestWave = Math.max(this.save.bestWave, this.wave);
     const bonus = 18 + this.wave * 6;
-    this.giveGold(bonus);
+    for (const q of this.allPlayers()) this.credit(q, { gold: bonus });
     this.save.hp = Math.min(this.maxHp, this.save.hp + Math.round(this.maxHp * 0.22));
+    for (const r of this.remotes.values()) if (r.active) r.hp = Math.min(r.maxHp, r.hp + Math.round(r.maxHp * 0.22));
     if (this.player) this.player.hp = this.save.hp;
     this.floater(this.player.x, this.player.y - 46, `WAVE CLEAR +${bonus}`, '#ffd447', 2);
     this.saveNow();
@@ -250,16 +314,19 @@ export class Game {
     clearTileCache();
     this.scene.oreNodes = [];
     this.scene.populateOres(this.wave);
+    this.oreDirty = true;
     this.scene.wave = this.wave;
     this.startMiningPhase(true);
     this.mobs = [];
     this.projectiles = [];
     this.save.hp = Math.min(this.maxHp, this.save.hp + 8);
     this.player.hp = this.save.hp;
+    for (const r of this.remotes.values()) if (r.active) r.hp = Math.min(r.maxHp, r.hp + 8);
     this.saveNow();
   }
 
   leaveMine(reason = 'retreat') {
+    this.netLeaveCave(reason);
     const earned = this.runGold;
     this.save.bestWave = Math.max(this.save.bestWave, this.wave - 1);
     // Escaping through the portal keeps everything. Dying costs half of what
@@ -287,6 +354,7 @@ export class Game {
   }
 
   enterHub() {
+    this.remotes.clear();
     this.scene = new World({ kind: 'hub', seed: 4242 });
     clearTileCache();
     this.player = {
@@ -336,6 +404,10 @@ export class Game {
   update(dt) {
     dt = Math.min(dt, 1 / 30);
     this.time += dt;
+    if (this.net && this.saveDirty) {
+      this.saveSendTimer -= dt;
+      if (this.saveSendTimer <= 0) this.flushSave();
+    }
     this.shake = Math.max(0, this.shake - dt * 4);
     this.hitFlash = Math.max(0, this.hitFlash - dt * 2.4);
     for (let i = this.toasts.length - 1; i >= 0; i--) {
@@ -412,8 +484,13 @@ export class Game {
       this.enterHub();
     }
     if (ui.wasClicked('wipe')) {
-      wipeSave();
-      this.save = loadSave();
+      if (this.net) {
+        this.save = defaultSave();
+        this.saveNow();
+      } else {
+        wipeSave();
+        this.save = loadSave();
+      }
       this.toast('Save data wiped', '#ff9db1');
     }
   }
@@ -542,6 +619,10 @@ export class Game {
       return;
     }
 
+    if (this.peerCave) {
+      this.updateMinePeer(dt);
+      return;
+    }
     this.waveBanner = Math.max(0, this.waveBanner - dt);
     this.handleMovement(dt, p, true);
 
@@ -572,6 +653,7 @@ export class Game {
     if (wantsAttack && p.attackTimer <= 0 && !ui.consumedClick) {
       this.doAttack(p);
     }
+    this.updateRemotes(dt);
 
     // ------------------------------------------------ ore hits
     for (const n of this.scene.oreNodes) {
@@ -592,6 +674,7 @@ export class Game {
     this.updateProjectiles(dt);
     if (this.state !== STATE.MINE) return;
     this.updatePickups(dt);
+    this.netTick(dt);
 
     // ------------------------------------------------ spawn queue
     if (this.waveState === 'fight' && this.spawnQueue.length) {
@@ -631,15 +714,537 @@ export class Game {
     }
   }
 
+  // ------------------------------------------------------------------ co-op
+  // Host-authoritative co-op. The player who opens the cave runs the whole
+  // simulation (mobs, waves, ore, pickups, combat) for everyone inside it.
+  // Everyone else keeps their own movement and input, sends it to the sim
+  // host, and mirrors the snapshots the host sends back. Gold, kills and ore
+  // are credited to the player who earned them.
+
+  attachNet(net, save) {
+    this.net = net;
+    this.myId = net.id;
+    this.save = save;
+    this.saveDirty = false;
+    this.simCave = false;
+    this.peerCave = false;
+    this.joinPending = false;
+    this.pendingOpen = false;
+    this.remotes.clear();
+    net.handler = (msg) => this.onNet(msg);
+    this.onRoomChange?.();
+  }
+
+  detachNet() {
+    if (!this.net) return;
+    if (this.state === STATE.MINE) this.leaveMine('retreat');
+    if (this.saveDirty) this.flushSave();
+    this.net.close();
+    this.net = null;
+    this.myId = null;
+    this.simCave = false;
+    this.peerCave = false;
+    this.joinPending = false;
+    this.pendingOpen = false;
+    this.saveDirty = false;
+    this.remotes.clear();
+    this.save = loadSave();
+    this.onRoomChange?.();
+  }
+
+  // Name of the player running the open cave, if it is someone else.
+  caveHostName() {
+    if (!this.net || !this.net.caveHost || this.net.caveHost === this.net.name) return null;
+    return this.net.caveHost;
+  }
+
+  // Joins and opens are fire-and-forget over the socket; give up after a while
+  // so a lost reply can never leave the portal locked.
+  requestStale(since) {
+    return Date.now() - since > 6000;
+  }
+
+  // Leave the room (and any cave) but keep the connection and the save.
+  leaveRoom() {
+    if (!this.net) return;
+    if (this.state === STATE.MINE) this.leaveMine('retreat');
+    if (this.saveDirty) this.flushSave();
+    this.net.send({ t: 'leave-room' });
+    this.net.code = null;
+    this.net.players = [];
+    this.net.caveHost = null;
+    this.onRoomChange?.();
+  }
+
+  onNet(msg) {
+    switch (msg.t) {
+      case 'cave-ok':
+        if (this.pendingOpen) {
+          this.pendingOpen = false;
+          this.beginSimCave();
+        }
+        break;
+      case 'cave-busy':
+        // someone beat us to it: join their cave instead
+        this.pendingOpen = false;
+        this.startCoopRun();
+        break;
+      case 'cave-open':
+        if (!this.simCave) this.toast(`${msg.host} opened the cave - press E at the portal to join`, '#7fe6a4');
+        break;
+      case 'cave-closed':
+        this.joinPending = false;
+        if (this.peerCave) {
+          this.toast('The host closed the cave', '#ff9db1');
+          this.leaveMine('retreat');
+        }
+        break;
+      case 'sim-msg':
+        this.onSimMsg(msg.from, msg.msg);
+        break;
+      case 'error':
+        this.joinPending = false;
+        this.pendingOpen = false;
+        this.toast(msg.text, '#ff9db1');
+        break;
+      case 'disconnected':
+        this.toast('Lost the co-op connection', '#ff9db1');
+        this.detachNet();
+        break;
+      default:
+        break;
+    }
+    if (['roster', 'room', 'cave-open', 'cave-closed', 'disconnected'].includes(msg.t)) this.onRoomChange?.();
+  }
+
+  startCoopRun() {
+    if (!this.net || this.net.closed) return;
+    if (this.joinPending && !this.requestStale(this.joinAt)) return;
+    if (this.pendingOpen && !this.requestStale(this.openAt)) return;
+    this.joinPending = false;
+    this.pendingOpen = false;
+    const host = this.caveHostName();
+    if (host) {
+      this.joinPending = true;
+      this.joinAt = Date.now();
+      this.net.send({ t: 'to-sim', msg: { t: 'join', name: this.net.name, hp: this.save.hp, stats: this.myStats() } });
+      this.toast(`Joining ${host}'s cave...`, '#7fe6a4');
+      return;
+    }
+    // Nobody has a cave open: open one and run the simulation here.
+    this.pendingOpen = true;
+    this.openAt = Date.now();
+    this.net.send({ t: 'cave-open' });
+  }
+
+  beginSimCave() {
+    this.simCave = true;
+    this.remotes.clear();
+    this.beginRun();
+    this.netSnapTimer = 0;
+    this.toast('Cave open - friends can press E at the portal to join', '#7fe6a4');
+    this.onRoomChange?.();
+  }
+
+  peerStart(msg) {
+    this.joinPending = false;
+    this.peerCave = true;
+    this.remotes.clear();
+    this.runGold = 0;
+    this.runKills = 0;
+    this.runOres = 0;
+    this.projectiles = [];
+    this.pickups = [];
+    this.particles = [];
+    this.floaters = [];
+    this.netInputTimer = 0;
+    this.enterMine(msg.wave, msg.seed, msg.ore);
+    this.toast('Joined the cave', '#7fe6a4');
+  }
+
+  netLeaveCave(reason) {
+    if (!this.net) return;
+    if (this.simCave) {
+      this.simCave = false;
+      this.remotes.clear();
+      this.net.send({ t: 'to-all', msg: { t: 'cave-end', reason } });
+      this.net.send({ t: 'cave-close' });
+    }
+    if (this.peerCave) {
+      this.peerCave = false;
+      this.remotes.clear();
+      this.net.send({ t: 'to-sim', msg: { t: 'leave' } });
+    }
+    this.joinPending = false;
+  }
+
+  onSimMsg(from, msg) {
+    if (!msg) return;
+    if (this.simCave) {
+      if (msg.t === 'join') this.simJoin(from, msg);
+      else if (msg.t === 'input') this.simInput(from, msg);
+      else if (msg.t === 'leave') this.remotes.delete(from);
+      return;
+    }
+    if (msg.t === 'cave-start') {
+      if (this.joinPending) this.peerStart(msg);
+      return;
+    }
+    if (!this.peerCave) return;
+    if (msg.t === 'snap') {
+      this.applySnapshot(msg);
+    } else if (msg.t === 'credit') {
+      this.applyCredit(msg);
+    } else if (msg.t === 'down') {
+      this.toast('You went down - the cave goes on without you', '#ff9db1');
+      this.leaveMine('dead');
+    } else if (msg.t === 'cave-end') {
+      this.leaveMine('retreat');
+    }
+  }
+
+  // Sim host: a peer asked to join the running cave.
+  simJoin(from, msg) {
+    if (this.state !== STATE.MINE || !this.scene) {
+      this.sendTo(from, { t: 'cave-end', reason: 'closed' });
+      return;
+    }
+    const stats = sanitizeStats(msg.stats);
+    const spawn = this.scene.spawn;
+    const r = {
+      id: from,
+      name: String(msg.name || 'Player').replace(/[^A-Za-z0-9 _-]/g, '').slice(0, 12) || 'Player',
+      x: spawn.x,
+      y: spawn.y,
+      facing: { x: 0, y: 1 },
+      moving: false,
+      walkPhase: 0,
+      attackAnim: 0,
+      attackTimer: 0,
+      swingAngle: Math.PI / 2,
+      invuln: 0,
+      held: false,
+      active: true,
+      stats,
+      maxHp: stats.maxHp,
+      hp: clamp(Math.round(Number(msg.hp)) || stats.maxHp, 1, stats.maxHp),
+      mineProgress: 0,
+      mineTarget: null,
+    };
+    this.remotes.set(from, r);
+    this.sendTo(from, { t: 'cave-start', seed: this.scene.seed, wave: this.wave, ore: serializeOre(this.scene.oreNodes) });
+    this.toast(`${r.name} joined the cave`, '#7fe6a4');
+  }
+
+  // Sim host: a peer's position and controls for this frame.
+  simInput(from, msg) {
+    const r = this.remotes.get(from);
+    if (!r || !r.active) return;
+    const num = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
+    r.x = clamp(num(msg.x, r.x), 10, VIEW_W - 10);
+    r.y = clamp(num(msg.y, r.y), 10, VIEW_H - 10);
+    r.facing.x = clamp(num(msg.fx, r.facing.x), -1, 1);
+    r.facing.y = clamp(num(msg.fy, r.facing.y), -1, 1);
+    r.moving = !!msg.mv;
+    r.walkPhase = num(msg.wp, r.walkPhase);
+    r.swingAngle = num(msg.sa, r.swingAngle);
+    r.held = !!msg.held;
+  }
+
+  sendTo(id, msg) {
+    if (this.net) this.net.send({ t: 'to-peer', to: id, msg });
+  }
+
+  downRemote(r) {
+    r.active = false;
+    this.sendTo(r.id, { t: 'down' });
+    this.toast(`${r.name} went down`, '#ff9db1');
+  }
+
+  allPlayers() {
+    const list = [];
+    if (this.player && this.state === STATE.MINE) list.push(this.player);
+    for (const r of this.remotes.values()) if (r.active) list.push(r);
+    return list;
+  }
+
+  nearestPlayer(x, y) {
+    let best = this.player;
+    let bestD = best ? Math.hypot(best.x - x, best.y - y) : Infinity;
+    for (const r of this.remotes.values()) {
+      if (!r.active) continue;
+      const d = Math.hypot(r.x - x, r.y - y);
+      if (d < bestD) {
+        bestD = d;
+        best = r;
+      }
+    }
+    return best;
+  }
+
+  // Combat/mining stats for a player: local players come from the save, remote
+  // players from the stats they sent when they joined.
+  statsOf(p) {
+    if (!p || p === this.player) {
+      return {
+        damage: this.sword.damage,
+        power: this.pickaxe.power,
+        goldMul: this.pickaxe.gold,
+        crit: this.critChance,
+        maxHp: this.maxHp,
+      };
+    }
+    return p.stats;
+  }
+
+  myStats() {
+    const s = this.statsOf(null);
+    return { damage: s.damage, power: s.power, goldMul: s.goldMul, crit: s.crit, maxHp: s.maxHp };
+  }
+
+  credit(p, { gold = 0, kills = 0, ores = 0 } = {}) {
+    if (!p || p === this.player) {
+      this.applyCredit({ gold, kills, ores });
+      return;
+    }
+    const r = this.remotes.get(p.id);
+    if (r && r.active) this.sendTo(r.id, { t: 'credit', gold, kills, ores });
+  }
+
+  applyCredit({ gold = 0, kills = 0, ores = 0 } = {}) {
+    if (gold) this.giveGold(gold);
+    this.runKills += kills;
+    this.runOres += ores;
+    if (kills) this.save.kills = (this.save.kills || 0) + kills;
+    if (ores) this.save.oresMined = (this.save.oresMined || 0) + ores;
+    if (this.net) this.saveDirty = true;
+    if (this.peerCave && gold && this.player) {
+      play('coin');
+      this.floater(this.player.x + rand(-10, 10), this.player.y - 34, `+${Math.round(gold)}`, '#ffd447', 2);
+    }
+  }
+
+  // Sim host: remote players' cooldowns and their swings/mining.
+  updateRemotes(dt) {
+    for (const r of this.remotes.values()) {
+      if (!r.active) continue;
+      r.invuln = Math.max(0, r.invuln - dt);
+      r.attackTimer = Math.max(0, r.attackTimer - dt);
+      r.attackAnim = Math.max(0, r.attackAnim - dt);
+      if (this.waveState === 'mining' && r.hp < r.maxHp) r.hp = Math.min(r.maxHp, r.hp + dt * 1.6);
+      if (r.held && r.attackTimer <= 0) this.doAttack(r);
+      if (this.waveState === 'mining') this.handleMining(dt, r, r.held);
+    }
+  }
+
+  // Sim host: broadcast the cave ~15 times a second while anyone else is in it.
+  netTick(dt) {
+    if (!this.simCave || !this.net || this.remotes.size === 0) return;
+    this.netSnapTimer -= dt;
+    if (this.netSnapTimer > 0) return;
+    this.netSnapTimer = 1 / 15;
+    this.net.send({ t: 'to-all', msg: this.buildSnapshot() });
+    this.oreDirty = false;
+  }
+
+  buildSnapshot() {
+    const players = [];
+    const add = (p, id, name) => {
+      players.push({
+        id,
+        name,
+        x: round1(p.x),
+        y: round1(p.y),
+        fx: round2(p.facing.x),
+        fy: round2(p.facing.y),
+        mv: !!p.moving,
+        wp: round2(p.walkPhase || 0),
+        aa: round2(p.attackAnim || 0),
+        sa: round2(p.swingAngle || 0),
+        hp: Math.max(0, Math.round(p.hp)),
+        mh: this.statsOf(p).maxHp,
+        iv: round2(p.invuln || 0),
+      });
+    };
+    if (this.player) add(this.player, this.myId, this.net.name);
+    for (const r of this.remotes.values()) if (r.active) add(r, r.id, r.name);
+
+    const snap = {
+      t: 'snap',
+      wave: this.wave,
+      ws: this.waveState,
+      mt: round2(this.mineTimer),
+      wt: round2(this.waveTimer),
+      sq: this.spawnQueue.length,
+      mobs: this.mobs
+        .filter((m) => !m.dead)
+        .map((m) => ({
+          k: m.kind,
+          x: round1(m.x),
+          y: round1(m.y),
+          hp: round1(m.hp),
+          mh: m.maxHp,
+          f: round2(m.flash),
+          fa: m.facing,
+          s: m.state,
+          st: round2(m.stateTimer || 0),
+          a: round2(m.anim),
+          r: m.radius,
+        })),
+      projectiles: this.projectiles.map((pr) => ({ x: round1(pr.x), y: round1(pr.y), vx: round1(pr.vx), vy: round1(pr.vy), r: pr.r, c: pr.color, a: round2(pr.anim) })),
+      pickups: this.pickups.map((c) => ({ x: round1(c.x), y: round1(c.y), v: c.value, l: round2(c.life), b: round2(c.bob), g: !!c.gem, c: c.color || null, d: round2(c.delay || 0) })),
+      orehp: this.scene.oreNodes.map((n) => [round1(n.hp), n.dead ? 1 : 0]),
+      players,
+    };
+    if (this.oreDirty) snap.ore = serializeOre(this.scene.oreNodes);
+    return snap;
+  }
+
+  // Peer: mirror the sim host's world.
+  applySnapshot(s) {
+    if (!this.scene || this.state !== STATE.MINE) return;
+    if (s.wave !== this.wave) {
+      this.wave = s.wave;
+      this.scene.biome = biomeForWave(this.wave);
+      clearTileCache();
+      this.waveBanner = 2.0;
+    }
+    this.waveState = s.ws;
+    this.mineTimer = s.mt;
+    this.waveTimer = s.wt;
+    this.spawnQueue = new Array(s.sq); // only .length is read (HUD)
+    if (s.ore) {
+      this.scene.oreNodes = restoreOre(s.ore);
+    } else {
+      this.scene.oreNodes.forEach((n, i) => {
+        const v = s.orehp[i];
+        if (v) {
+          n.hp = v[0];
+          n.dead = !!v[1];
+        }
+      });
+    }
+    this.mobs = s.mobs.map((o) => ({
+      kind: o.k,
+      x: o.x,
+      y: o.y,
+      hp: o.hp,
+      maxHp: o.mh,
+      flash: o.f,
+      facing: o.fa,
+      state: o.s,
+      stateTimer: o.st,
+      anim: o.a,
+      radius: o.r,
+      def: mobDef(o.k),
+      dead: false,
+    }));
+    this.projectiles = s.projectiles.map((o) => ({ x: o.x, y: o.y, vx: o.vx, vy: o.vy, r: o.r, color: o.c, anim: o.a, life: 1, damage: 0 }));
+    this.pickups = s.pickups.map((o) => ({ x: o.x, y: o.y, value: o.v, life: o.l, bob: o.b, gem: o.g, color: o.c, delay: o.d }));
+
+    const seen = new Set();
+    for (const pl of s.players) {
+      if (pl.id === this.myId) {
+        const me = this.player;
+        if (me) {
+          // the host runs the hits, so the peer shows the hit feedback here
+          const lost = Math.round(me.hp - pl.hp);
+          if (lost > 0 && pl.hp > 0) {
+            this.hitFlash = 1;
+            this.shake = Math.min(1.3, this.shake + 0.5);
+            play('hurt');
+            this.floater(me.x, me.y - 42, `-${lost}`, '#ff7b8a', 2);
+          }
+          me.hp = pl.hp;
+          me.invuln = pl.iv;
+          me.attackAnim = pl.aa;
+          me.maxHp = pl.mh;
+          this.save.hp = pl.hp;
+        }
+        continue;
+      }
+      seen.add(pl.id);
+      let r = this.remotes.get(pl.id);
+      if (!r) {
+        r = { id: pl.id, facing: { x: 0, y: 1 }, held: false, active: true, walkPhase: 0 };
+        this.remotes.set(pl.id, r);
+      }
+      r.name = pl.name;
+      r.x = pl.x;
+      r.y = pl.y;
+      r.facing.x = pl.fx;
+      r.facing.y = pl.fy;
+      r.moving = pl.mv;
+      r.walkPhase = pl.wp;
+      r.attackAnim = pl.aa;
+      r.swingAngle = pl.sa;
+      r.hp = pl.hp;
+      r.maxHp = pl.mh;
+      r.invuln = pl.iv;
+    }
+    for (const id of [...this.remotes.keys()]) if (!seen.has(id)) this.remotes.delete(id);
+  }
+
+  // Peer: our own movement, aim and buttons go to the sim host ~30 times a second.
+  updateMinePeer(dt) {
+    const p = this.player;
+    const ui = this.ui;
+    this.waveBanner = Math.max(0, this.waveBanner - dt);
+    this.handleMovement(dt, p, true);
+    for (const r of this.remotes.values()) if (r.moving) r.walkPhase += dt * 11;
+
+    const aimX = this.input.mouse.x - p.x;
+    const aimY = this.input.mouse.y - p.y;
+    p.swingAngle = Math.hypot(aimX, aimY) > 4 ? Math.atan2(aimY, aimX) : Math.atan2(p.facing.y, p.facing.x);
+
+    this.netInputTimer -= dt;
+    if (this.netInputTimer <= 0) {
+      this.netInputTimer = 1 / 30;
+      const held = (this.input.mouse.down && !ui.consumedClick) || this.input.isDown(' ', 'j');
+      this.net.send({
+        t: 'to-sim',
+        msg: {
+          t: 'input',
+          x: round1(p.x),
+          y: round1(p.y),
+          fx: round2(p.facing.x),
+          fy: round2(p.facing.y),
+          mv: !!p.moving,
+          wp: round2(p.walkPhase || 0),
+          sa: round2(p.swingAngle),
+          held,
+        },
+      });
+    }
+
+    const portal = this.scene.portal;
+    if (this.input.wasPressed('e') && Math.hypot(p.x - portal.x, p.y - portal.y) < 54) {
+      this.leaveMine('retreat');
+      return;
+    }
+    if (ui.wasClicked('leave_mine')) this.leaveMine('retreat');
+  }
+
+  // Save progress to the server profile (throttled).
+  flushSave() {
+    this.saveDirty = false;
+    this.saveSendTimer = 0.5;
+    this.net.send({ t: 'save', save: this.save });
+  }
+
+  drawNameTag(ctx, r) {
+    drawText(ctx, r.name || 'Player', r.x, r.y - 50, 1, '#f2f0ff', { align: 'center', outline: '#141221' });
+  }
+
   doAttack(p) {
     p.attackTimer = PLAYER_BASE.attackCooldown;
     p.attackAnim = 0.2;
-    play('swoosh');
+    if (p === this.player) play('swoosh');
 
     // The sword swings all the way around the character: every mob and ore
     // node inside reach is hit regardless of where the cursor is.
     const reach = PLAYER_BASE.attackReach;
-    const dmgBase = this.sword.damage;
+    const st = this.statsOf(p);
     let hitAny = false;
 
     for (const m of this.mobs) {
@@ -649,9 +1254,9 @@ export class Game {
       const dist = Math.hypot(dx, dy);
       if (dist > reach + m.radius) continue;
       const a = Math.atan2(dy, dx);
-      const crit = Math.random() < this.critChance;
-      const dmg = Math.round(dmgBase * (crit ? 2 : 1) * rand(0.92, 1.08));
-      this.damageMob(m, dmg, crit, a);
+      const crit = Math.random() < st.crit;
+      const dmg = Math.round(st.damage * (crit ? 2 : 1) * rand(0.92, 1.08));
+      this.damageMob(m, dmg, crit, a, p);
       hitAny = true;
     }
 
@@ -661,7 +1266,7 @@ export class Game {
       const dx = n.x - p.x;
       const dy = n.y - p.y;
       if (Math.hypot(dx, dy) > reach + n.radius) continue;
-      this.chipOre(n, Math.max(1, this.sword.damage * 0.12), n.x, n.y);
+      this.chipOre(n, Math.max(1, st.damage * 0.12), n.x, n.y, false, p);
     }
 
     if (!hitAny) {
@@ -676,7 +1281,8 @@ export class Game {
     }
   }
 
-  damageMob(m, dmg, crit, angle) {
+  damageMob(m, dmg, crit, angle, attacker = this.player) {
+    m.lastHitBy = attacker;
     m.hp -= dmg;
     m.flash = 0.14;
     m.knockX = Math.cos(angle) * (m.def.behavior === 'boss' ? 0 : 210);
@@ -704,8 +1310,7 @@ export class Game {
 
   killMob(m) {
     m.dead = true;
-    this.runKills++;
-    this.save.kills = (this.save.kills || 0) + 1;
+    this.credit(m.lastHitBy || this.player, { kills: 1 });
     play('kill');
     this.shake = Math.min(1.2, this.shake + (m.def.behavior === 'boss' ? 1.1 : 0.22));
     this.addParticles(m.x, m.y - (m.def.height || 0), m.def.behavior === 'boss' ? 60 : 18, {
@@ -737,6 +1342,7 @@ export class Game {
       this.pickups.push({ x: m.x, y: m.y, vx: 0, vy: -40, value: 90, life: 16, delay: 0.4, bob: 0, gem: true });
       this.save.hp = Math.min(this.maxHp, this.save.hp + this.maxHp * 0.3);
       this.player.hp = this.save.hp;
+      for (const r of this.remotes.values()) if (r.active) r.hp = Math.min(r.maxHp, r.hp + r.maxHp * 0.3);
       this.toast('SKELETON KING SLAIN!', '#ffd447');
     }
     this.saveNow();
@@ -782,7 +1388,6 @@ export class Game {
   }
 
   updateMobs(dt) {
-    const p = this.player;
     for (let i = this.mobs.length - 1; i >= 0; i--) {
       const m = this.mobs[i];
       if (m.dead) {
@@ -793,13 +1398,14 @@ export class Game {
       m.hurtCd = Math.max(0, m.hurtCd - dt);
       m.anim += dt;
       const def = m.def;
+      const p = this.nearestPlayer(m.x, m.y);
       const dx = p.x - m.x;
       const dy = p.y - m.y;
       const dist = Math.hypot(dx, dy) || 1;
       let nx = dx / dist;
       let ny = dy / dist;
       // Path around walls: use the BFS flow field when the player isn't in sight.
-      if (dist > 60 && !this.scene.hasLineOfSight(m.x, m.y, p.x, p.y)) {
+      if (p === this.player && dist > 60 && !this.scene.hasLineOfSight(m.x, m.y, p.x, p.y)) {
         const dir = this.scene.flowDirAt(m.x, m.y, p.x, p.y);
         if (dir) {
           nx = dir.x;
@@ -919,7 +1525,9 @@ export class Game {
                 });
               }
               this.shake = 1.2;
-              if (Math.hypot(p.x - m.x, p.y - m.y) < radius) this.hurtPlayer(def.damage * 1.15, m.x, m.y);
+              for (const q of this.allPlayers()) {
+                if (Math.hypot(q.x - m.x, q.y - m.y) < radius) this.hurtPlayer(q, def.damage * 1.15, m.x, m.y);
+              }
               m.state = 'idle';
               m.stateTimer = rand(2.4, 3.4);
             }
@@ -984,7 +1592,7 @@ export class Game {
       // contact damage
       if (dist < m.radius + PLAYER_BASE.radius + 2 && m.hurtCd <= 0) {
         m.hurtCd = 0.7;
-        this.hurtPlayer(def.damage, m.x, m.y);
+        this.hurtPlayer(p, def.damage, m.x, m.y);
       }
     }
   }
@@ -1031,7 +1639,6 @@ export class Game {
   }
 
   updateProjectiles(dt) {
-    const p = this.player;
     for (let i = this.projectiles.length - 1; i >= 0; i--) {
       const pr = this.projectiles[i];
       pr.life -= dt;
@@ -1047,8 +1654,9 @@ export class Game {
         this.projectiles.splice(i, 1);
         continue;
       }
-      if (Math.hypot(pr.x - p.x, pr.y - p.y - 8) < pr.r + PLAYER_BASE.radius) {
-        this.hurtPlayer(pr.damage, pr.x, pr.y);
+      const hit = this.allPlayers().find((q) => Math.hypot(pr.x - q.x, pr.y - q.y - 8) < pr.r + PLAYER_BASE.radius);
+      if (hit) {
+        this.hurtPlayer(hit, pr.damage, pr.x, pr.y);
         this.addParticles(pr.x, pr.y, 12, { color: pr.color, speed: 120, size: 3, life: 0.4 });
         this.projectiles.splice(i, 1);
       }
@@ -1057,16 +1665,20 @@ export class Game {
     // mob projectiles vs ore? skip. player melee vs projectiles: deflect (nice touch)
   }
 
-  hurtPlayer(dmg, fromX, fromY) {
-    const p = this.player;
-    if (p.invuln > 0 || this.state !== STATE.MINE) return;
+  hurtPlayer(p, dmg, fromX, fromY) {
+    if (!p || p.invuln > 0 || this.state !== STATE.MINE) return;
+    const local = p === this.player;
     p.invuln = PLAYER_BASE.invulnTime;
     const d = Math.round(dmg);
-    this.save.hp = Math.max(0, this.save.hp - d);
-    p.hp = this.save.hp;
-    this.hitFlash = 1;
-    this.shake = Math.min(1.3, this.shake + 0.5);
-    play('hurt');
+    if (local) {
+      this.save.hp = Math.max(0, this.save.hp - d);
+      p.hp = this.save.hp;
+      this.hitFlash = 1;
+      this.shake = Math.min(1.3, this.shake + 0.5);
+      play('hurt');
+    } else {
+      p.hp = Math.max(0, p.hp - d);
+    }
     this.floater(p.x, p.y - 42, `-${d}`, '#ff7b8a', 2);
     this.addParticles(p.x, p.y - 8, 12, { color: '#ff5f7a', speed: 140, size: 3, life: 0.5, gravity: 200 });
     // knockback away from source
@@ -1076,12 +1688,15 @@ export class Game {
     const res = this.scene.moveCircle(p.x, p.y, PLAYER_BASE.radius, (dx / dl) * 16, (dy / dl) * 16, true);
     p.x = clamp(res.x, 10, VIEW_W - 10);
     p.y = clamp(res.y, 10, VIEW_H - 10);
-    this.saveNow();
-    if (this.save.hp <= 0) this.leaveMine('dead');
+    if (local) {
+      this.saveNow();
+      if (this.save.hp <= 0) this.leaveMine('dead');
+    } else if (p.hp <= 0) {
+      this.downRemote(p);
+    }
   }
 
-  handleMining(dt) {
-    const p = this.player;
+  handleMining(dt, p = this.player, holding = null) {
     // pickaxe reaches a full 360 degrees: mine the nearest ore node in range
     let best = null;
     let bestDist = Infinity;
@@ -1095,13 +1710,13 @@ export class Game {
       }
     }
     p.mineTarget = best;
-    const holding = (this.input.mouse.down && !this.ui.consumedClick) || this.input.isDown(' ', 'j');
+    if (holding === null) holding = (this.input.mouse.down && !this.ui.consumedClick) || this.input.isDown(' ', 'j');
 
     if (best && holding) {
       p.mineProgress += dt;
       if (p.mineProgress >= HIT_INTERVAL) {
         p.mineProgress = 0;
-        this.mineHit(best);
+        this.mineHit(best, p);
       }
       p.attackAnim = 0.14;
       p.attackTimer = Math.max(p.attackTimer, 0.1);
@@ -1110,10 +1725,9 @@ export class Game {
     }
   }
 
-  mineHit(node) {
-    const p = this.player;
-    const power = this.pickaxe.power;
-    const dmg = power * rand(0.85, 1.15);
+  mineHit(node, owner = this.player) {
+    const p = owner;
+    const dmg = this.statsOf(owner).power * rand(0.85, 1.15);
     play('mine');
     this.shake = Math.min(1, this.shake + 0.07);
     this.addParticles(node.x, node.y, 8, {
@@ -1134,10 +1748,10 @@ export class Game {
     });
     node.hitFlash = 0.5;
     node.shake = 0.4;
-    this.chipOre(node, dmg, node.x, node.y, true);
+    this.chipOre(node, dmg, node.x, node.y, true, owner);
   }
 
-  chipOre(node, dmg, fx, fy, fromPick = false) {
+  chipOre(node, dmg, fx, fy, fromPick = false, owner = this.player) {
     if (node.dead) return;
     node.hp -= dmg;
     if (node.hp <= 0) {
@@ -1153,7 +1767,7 @@ export class Game {
         gravity: 400,
       });
       this.addParticles(node.x, node.y, 10, { color: '#8a5c33', speed: 150, size: 4, life: 0.6, gravity: 300 });
-      const value = Math.round(node.type.value * this.pickaxe.gold * (1 + (this.wave - 1) * 0.12));
+      const value = Math.round(node.type.value * this.statsOf(owner).goldMul * (1 + (this.wave - 1) * 0.12));
       this.pickups.push({
         x: node.x,
         y: node.y,
@@ -1166,13 +1780,11 @@ export class Game {
         gem: node.type.value >= 34,
         color: node.type.color,
       });
-      this.runOres++;
-      this.save.oresMined = (this.save.oresMined || 0) + 1;
+      this.credit(owner, { ores: 1 });
     }
   }
 
   updatePickups(dt) {
-    const p = this.player;
     for (let i = this.pickups.length - 1; i >= 0; i--) {
       const c = this.pickups[i];
       c.life -= dt;
@@ -1189,7 +1801,8 @@ export class Game {
         c.vy *= 1 - 4 * dt;
         continue;
       }
-      // magnet toward the player
+      // magnet toward the nearest player; whoever collects it gets the gold
+      const p = this.nearestPlayer(c.x, c.y);
       const dx = p.x - c.x;
       const dy = p.y - 10 - c.y;
       const d = Math.hypot(dx, dy) || 1;
@@ -1197,9 +1810,11 @@ export class Game {
       c.x += (dx / d) * pull * dt;
       c.y += (dy / d) * pull * dt;
       if (d < 20) {
-        this.giveGold(c.value);
-        play('coin');
-        this.floater(p.x + rand(-10, 10), p.y - 34, `+${Math.round(c.value)}`, '#ffd447', 2);
+        this.credit(p, { gold: c.value });
+        if (p === this.player) {
+          play('coin');
+          this.floater(p.x + rand(-10, 10), p.y - 34, `+${Math.round(c.value)}`, '#ffd447', 2);
+        }
         this.addParticles(c.x, c.y, 4, { color: '#fff3a8', speed: 60, size: 2, life: 0.3 });
         this.pickups.splice(i, 1);
       }
@@ -1419,6 +2034,16 @@ export class Game {
     if (this.player) {
       list.push({ y: this.player.y, d: () => this.drawPlayer(ctx, this.player) });
     }
+    for (const r of this.remotes.values()) {
+      if (!r.active) continue;
+      list.push({
+        y: r.y,
+        d: () => {
+          this.drawPlayer(ctx, r);
+          this.drawNameTag(ctx, r);
+        },
+      });
+    }
     for (const m of this.mobs) {
       list.push({ y: m.y, d: () => this.drawMob(ctx, m) });
     }
@@ -1431,6 +2056,9 @@ export class Game {
     // swing arc on top
     if (this.player && this.player.attackAnim > 0 && this.state === STATE.MINE) {
       this.drawSwing(ctx, this.player);
+    }
+    for (const r of this.remotes.values()) {
+      if (r.active && r.attackAnim > 0 && this.state === STATE.MINE) this.drawSwing(ctx, r);
     }
     this.renderProjectiles(ctx);
   }
@@ -1468,7 +2096,8 @@ export class Game {
     this.drawHeldWeapon(ctx, p);
 
     // HP ring under the player when hurt
-    if (this.save.hp / this.maxHp < 0.34) {
+    const hpPct = p === this.player ? this.save.hp / this.maxHp : p.hp / p.maxHp;
+    if (hpPct < 0.34) {
       ctx.save();
       ctx.globalAlpha = 0.5 + 0.4 * Math.sin(this.time * 6);
       ctx.strokeStyle = '#ff5f7a';

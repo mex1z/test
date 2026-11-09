@@ -19,7 +19,7 @@ export function defaultSave() {
   };
 }
 
-function sanitize(obj) {
+export function sanitizeSave(obj) {
   const base = defaultSave();
   if (!obj || typeof obj !== 'object') return base;
   const out = { ...base };
@@ -37,7 +37,7 @@ export function loadSave() {
   try {
     const raw = localStorage.getItem(KEY);
     if (!raw) return defaultSave();
-    return sanitize(JSON.parse(raw));
+    return sanitizeSave(JSON.parse(raw));
   } catch {
     return defaultSave();
   }
@@ -45,7 +45,7 @@ export function loadSave() {
 
 export function writeSave(data) {
   try {
-    localStorage.setItem(KEY, JSON.stringify(sanitize(data)));
+    localStorage.setItem(KEY, JSON.stringify(sanitizeSave(data)));
     return true;
   } catch {
     return false;

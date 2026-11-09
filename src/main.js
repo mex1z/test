@@ -1,6 +1,7 @@
 import { Game } from './game.js';
 import { Input } from './input.js';
 import { buildAllSprites } from './sprites.js';
+import { setupLobby } from './lobby.js';
 
 const LOGICAL_W = 960;
 const LOGICAL_H = 576;
@@ -33,6 +34,7 @@ function boot() {
   const input = new Input(canvas, LOGICAL_W, LOGICAL_H);
   const game = new Game(canvas, input);
   window.__game = game; // handy for debugging in the console
+  setupLobby(game);
 
   fit(canvas);
   window.addEventListener('resize', () => fit(canvas));

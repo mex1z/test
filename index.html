@@ -70,6 +70,80 @@
     text-align: center;
     z-index: 10;
   }
+  #friends-btn {
+    position: fixed;
+    top: 10px;
+    right: 12px;
+    z-index: 5;
+    font: inherit;
+    font-size: 12px;
+    letter-spacing: 1px;
+    padding: 6px 10px;
+    background: #2a2344;
+    color: #d9d2ff;
+    border: 2px solid #3a3358;
+    border-radius: 2px;
+    cursor: pointer;
+  }
+  #friends-btn:hover { background: #342b55; }
+  #lobby {
+    position: fixed;
+    inset: 0;
+    z-index: 6;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(8, 7, 15, 0.78);
+  }
+  #lobby[hidden] { display: none; }
+  .lobby-box {
+    width: min(440px, 92vw);
+    background: #17142a;
+    border: 3px solid #3a3358;
+    border-radius: 2px;
+    padding: 18px 20px;
+    color: #e8e4ff;
+    font-size: 13px;
+    line-height: 1.5;
+    box-shadow: 0 0 40px rgba(120, 96, 220, 0.3);
+  }
+  .lobby-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    font-size: 15px;
+    letter-spacing: 2px;
+    color: #ffd447;
+  }
+  .lobby-box p { margin: 6px 0; color: #a49fc6; }
+  .lobby-box label { display: block; margin-top: 8px; color: #a49fc6; font-size: 12px; }
+  .lobby-box input {
+    font: inherit;
+    background: #0d0b19;
+    color: #f2f0ff;
+    border: 2px solid #3a3358;
+    padding: 6px 8px;
+    width: 100%;
+    margin: 4px 0 8px;
+  }
+  .lobby-row { display: flex; gap: 6px; align-items: center; }
+  .lobby-row input { margin: 0; width: auto; flex: 1; text-transform: uppercase; }
+  .lobby-box button {
+    font: inherit;
+    font-size: 12px;
+    background: #2a2344;
+    color: #e8e4ff;
+    border: 2px solid #3a3358;
+    padding: 6px 10px;
+    margin: 4px 6px 4px 0;
+    cursor: pointer;
+  }
+  .lobby-box button:hover { background: #3a3160; }
+  .lobby-box button:disabled { opacity: 0.5; cursor: default; }
+  .lobby-code { font-size: 30px; letter-spacing: 8px; color: #ffd447; margin: 8px 0; }
+  .lobby-box ul { margin: 6px 0; padding-left: 18px; }
+  .lobby-msg { margin-top: 10px; min-height: 1.5em; }
   @media (max-width: 640px) {
     #hint { display: none; }
     canvas#game { border-width: 2px; }
@@ -79,6 +153,13 @@
 <body>
   <div id="stage">
     <canvas id="game" width="960" height="576" aria-label="Deepmine game canvas"></canvas>
+  </div>
+  <button id="friends-btn" type="button">FRIENDS (CO-OP)</button>
+  <div id="lobby" hidden>
+    <div class="lobby-box" role="dialog" aria-labelledby="lobby-title">
+      <div class="lobby-head"><span id="lobby-title">CO-OP</span><button id="lobby-close" type="button">CLOSE</button></div>
+      <div id="lobby-body"></div>
+    </div>
   </div>
   <div id="hint">WASD / ARROWS to move &nbsp;·&nbsp; CLICK or SPACE to attack/mine &nbsp;·&nbsp; E portal &nbsp;·&nbsp; ESC pause &nbsp;·&nbsp; M sound</div>
   <div id="fatal"></div>
