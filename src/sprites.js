@@ -79,9 +79,11 @@ export function drawSprite(ctx, sprite, x, y, scale = 2, opts = {}) {
   ctx.save();
   if (alpha !== 1) ctx.globalAlpha *= alpha;
   if (flip) {
-    ctx.translate(Math.round(x * 2), 0);
+    // Mirror around the sprite's own anchor x (not 2x, which threw flipped
+    // sprites far off to the side - e.g. slimes hopping left vanished).
+    ctx.translate(Math.round(x), 0);
     ctx.scale(-1, 1);
-    ctx.translate(-Math.round(x * 2), 0);
+    ctx.translate(-Math.round(x), 0);
   }
   ctx.imageSmoothingEnabled = false;
   ctx.drawImage(sprite.base, Math.round(dx), Math.round(dy), Math.round(w), Math.round(h));

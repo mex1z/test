@@ -197,8 +197,7 @@ export const PLAYER_BASE = {
   radius: 10,
   attackDamage: 0, // from sword
   attackCooldown: 0.42,
-  attackReach: 44,
-  attackArc: Math.PI * 0.78,
+  attackReach: 44, // swings hit everything within this radius, all around you
   critChance: 0.05,
   lightRadius: 235,
   invulnTime: 0.75,
