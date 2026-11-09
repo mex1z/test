@@ -2,10 +2,14 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { WebSocketServer } from 'ws';
+import { createRooms } from './server/rooms.js';
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
+// Co-op profiles (player name -> saved progress). Kept out of git by .gitignore.
+const SAVE_FILE = process.env.SAVE_FILE || path.join(ROOT, 'data', 'profiles.json');
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -58,6 +62,10 @@ const server = http.createServer((req, res) => {
   });
 });
 
+// Co-op WebSocket relay lives at /ws on the same port.
+const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 256 * 1024 });
+createRooms({ saveFile: SAVE_FILE, log: (m) => console.warn(m) }).attach(wss);
+
 server.listen(PORT, HOST, () => {
-  console.log(`Deepmine running at http://${HOST}:${PORT}`);
+  console.log(`Deepmine running at http://${HOST}:${PORT}  (co-op relay at /ws, profiles in ${SAVE_FILE})`);
 });

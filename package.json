@@ -8,9 +8,12 @@
     "dev": "node server.js",
     "start": "node server.js",
     "shots": "node tools/shots.mjs",
-    "test": "node tools/validate-art.mjs && node tools/smoke.mjs"
+    "test": "node tools/validate-art.mjs && node tools/smoke.mjs && node tools/coop.mjs"
   },
   "devDependencies": {
     "@napi-rs/canvas": "^1.1.0"
+  },
+  "dependencies": {
+    "ws": "^8.22.2"
   }
 }

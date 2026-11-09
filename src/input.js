@@ -21,6 +21,8 @@ export class Input {
 
   _bind() {
     window.addEventListener('keydown', (e) => {
+      // typing into a text box (the co-op name / room code) must not drive the game
+      if (e.target && /^(INPUT|TEXTAREA|SELECT)$/.test(e.target.tagName)) return;
       const k = e.key.toLowerCase();
       if (!this.keys.has(k)) this.pressed.add(k);
       this.keys.add(k);

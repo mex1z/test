@@ -13,8 +13,40 @@ node server.js       # or: npm start
 # open http://localhost:3000
 ```
 
-No build step and no runtime dependencies — plain ES modules served by a tiny static server.
-Everything (sprites, font, sound) is generated in code.
+No build step. Plain ES modules served by a tiny static server, plus one runtime dependency,
+`ws`, for the co-op relay. Everything (sprites, font, sound) is generated in code.
+
+## Play with friends (co-op)
+
+Up to **4 players** can share one cave.
+
+The player who opens the cave runs the simulation in their browser (mobs, waves, ore, pickups,
+combat). Everyone else moves and fights from their own browser, sends their input to the host, and
+shows what the host sends back. The server only relays messages and stores saves.
+
+1. The host runs `npm start` on their computer (port 3000 by default).
+2. Make it reachable by friends with a tunnel, for example `cloudflared tunnel --url http://localhost:3000`
+   or `ngrok http 3000`, and share the link it prints. Tunnels are not included.
+3. Everyone clicks **FRIENDS (CO-OP)**, enters a name, and connects.
+4. One player clicks **Create room** and shares the 4-letter code. The others type it into **Join**.
+5. In the hub, press `E` at the portal. The first player to do so opens the cave. Anyone else who
+   presses `E` joins it.
+
+Rules:
+- A player who dies goes back to the hub with the usual half-run-gold penalty. The cave goes on for the others.
+- If the host dies or leaves through the portal, the cave closes for everyone. The others keep what they earned.
+- Only the host can start a wave early with `F`. Pausing is local, so the cave keeps running for others.
+- Friends are only visible where your lantern reaches. Outside that light the cave is dark.
+
+Saves and names:
+- Co-op progress is saved on the server under your name, in `data/profiles.json`. Set `SAVE_FILE` to put it elsewhere.
+  Solo progress stays in this browser, as before.
+- Names are not passwords. Anyone who types your name gets your co-op save, so only play with friends you trust.
+  Two people cannot be online with the same name at once.
+
+Limits:
+- The game is only online while the host's computer is running the server and the tunnel. If the host's
+  computer sleeps or disconnects, the cave closes.
 
 ## How it plays
 
@@ -83,15 +115,20 @@ src/font.js         5x7 bitmap font and text helpers
 src/ui.js           immediate-mode pixel buttons/panels
 src/audio.js        procedural WebAudio sound effects
 src/save.js         localStorage save/load with validation
+src/net.js          browser side of the co-op connection (WebSocket)
+src/lobby.js        co-op panel: sign in, create/join a room
+server/rooms.js     co-op relay: rooms, cave hosting, profile store
 ```
 
 ## Dev tools
 
 ```bash
-npm test          # art validation + headless playthrough smoke test
+npm test          # art validation + headless playthrough + two-to-four player co-op test
 npm run shots     # render PNG screenshots of every screen (needs @napi-rs/canvas)
 ```
 
 `npm test` drives the real game headlessly through title → hub → shop purchases → mine → mining →
 waves → boss wave → pause → death → summary → hub and fails on runtime errors, NaN geometry,
-escaped players or stuck waves. The `shots/` folder was produced by `npm run shots`.
+escaped players or stuck waves. `tools/coop.mjs` runs the real co-op relay with several game
+instances: room codes, the 4-player cap, cave joins, movement and combat sync, credit, mining,
+waves, deaths, saves and leaving. The `shots/` folder was produced by `npm run shots`.
