@@ -48,7 +48,7 @@ Everything (sprites, font, sound) is generated in code.
 | Input | Action |
 | --- | --- |
 | `WASD` / arrows | Move |
-| Hold left click | Attack toward cursor / mine ore |
+| Hold left click | Swing all around you / mine nearby ore (360°) |
 | `SPACE` / `J` | Attack or mine (keyboard alternative) |
 | `E` | Use portal (enter or leave the mine) |
 | `F` | Start the wave immediately |

@@ -636,8 +636,9 @@ export class Game {
     p.attackAnim = 0.2;
     play('swoosh');
 
+    // The sword swings all the way around the character: every mob and ore
+    // node inside reach is hit regardless of where the cursor is.
     const reach = PLAYER_BASE.attackReach;
-    const arc = PLAYER_BASE.attackArc;
     const dmgBase = this.sword.damage;
     let hitAny = false;
 
@@ -648,10 +649,9 @@ export class Game {
       const dist = Math.hypot(dx, dy);
       if (dist > reach + m.radius) continue;
       const a = Math.atan2(dy, dx);
-      if (Math.abs(angDiff(a, p.swingAngle)) > arc / 2) continue;
       const crit = Math.random() < this.critChance;
       const dmg = Math.round(dmgBase * (crit ? 2 : 1) * rand(0.92, 1.08));
-      this.damageMob(m, dmg, crit, p.swingAngle);
+      this.damageMob(m, dmg, crit, a);
       hitAny = true;
     }
 
@@ -661,19 +661,17 @@ export class Game {
       const dx = n.x - p.x;
       const dy = n.y - p.y;
       if (Math.hypot(dx, dy) > reach + n.radius) continue;
-      const a = Math.atan2(dy, dx);
-      if (Math.abs(angDiff(a, p.swingAngle)) > arc / 2) continue;
       this.chipOre(n, Math.max(1, this.sword.damage * 0.12), n.x, n.y);
     }
 
     if (!hitAny) {
-      this.addParticles(p.x + Math.cos(p.swingAngle) * 26, p.y + Math.sin(p.swingAngle) * 26, 3, {
+      // whiff: a faint ring of sparks around the character instead of a cone
+      this.addParticles(p.x, p.y - 6, 10, {
         color: 'rgba(255,255,255,0.5)',
-        speed: 50,
+        speed: 60,
         size: 2,
         life: 0.18,
-        angle: p.swingAngle,
-        spread: 1.2,
+        spread: Math.PI * 2,
       });
     }
   }
@@ -1084,19 +1082,15 @@ export class Game {
 
   handleMining(dt) {
     const p = this.player;
-    // find nearest node in front of the player
+    // pickaxe reaches a full 360 degrees: mine the nearest ore node in range
     let best = null;
-    let bestScore = Infinity;
+    let bestDist = Infinity;
     for (const n of this.scene.oreNodes) {
       if (n.dead) continue;
-      const dx = n.x - p.x;
-      const dy = n.y - p.y;
-      const dist = Math.hypot(dx, dy);
+      const dist = Math.hypot(n.x - p.x, n.y - p.y);
       if (dist > 52 + n.radius) continue;
-      const dot = (dx / (dist || 1)) * p.facing.x + (dy / (dist || 1)) * p.facing.y;
-      const score = dist - dot * 22;
-      if (score < bestScore) {
-        bestScore = score;
+      if (dist < bestDist) {
+        bestDist = dist;
         best = n;
       }
     }
@@ -1501,21 +1495,21 @@ export class Game {
   }
 
   drawSwing(ctx, p) {
+    // full 360 degree sweep: a ring that expands out to the attack reach
     const t = 1 - p.attackAnim / 0.2;
-    const arc = PLAYER_BASE.attackArc;
     const r0 = 16;
     const r1 = PLAYER_BASE.attackReach + 10;
+    const rr = r0 + (r1 - r0) * Math.min(1, t * 1.4);
     ctx.save();
     ctx.globalAlpha = (1 - t) * 0.55;
-    const grad = ctx.createRadialGradient(p.x, p.y - 6, r0, p.x, p.y - 6, r1);
-    grad.addColorStop(0, 'rgba(255,255,255,0.05)');
-    grad.addColorStop(0.7, 'rgba(200,230,255,0.5)');
+    const grad = ctx.createRadialGradient(p.x, p.y - 6, r0 * 0.5, p.x, p.y - 6, rr);
+    grad.addColorStop(0, 'rgba(255,255,255,0.0)');
+    grad.addColorStop(0.7, 'rgba(200,230,255,0.42)');
     grad.addColorStop(1, 'rgba(255,255,255,0)');
     ctx.fillStyle = grad;
     ctx.beginPath();
-    ctx.moveTo(p.x, p.y - 6);
-    ctx.arc(p.x, p.y - 6, r1, p.swingAngle - arc / 2 + t * 0.5, p.swingAngle + arc / 2 + t * 0.5);
-    ctx.closePath();
+    ctx.arc(p.x, p.y - 6, rr, 0, Math.PI * 2);
+    ctx.arc(p.x, p.y - 6, r0 * 0.5, 0, Math.PI * 2, true);
     ctx.fill();
     ctx.restore();
   }
@@ -1686,9 +1680,8 @@ export class Game {
   }
 
   renderCursor(ctx) {
-    if (this.state === STATE.SHOP || this.state === STATE.SUMMARY || this.state === STATE.DEAD || this.state === STATE.TITLE) {
-      return;
-    }
+    // The canvas hides the system cursor everywhere (cursor: none), so the
+    // pixel cursor must be drawn on every screen, including menus.
     const m = this.input.mouse;
     const cx = Math.round(m.x);
     const cy = Math.round(m.y);
